@@ -49,8 +49,13 @@ module comm_tod_hfi_mod
     class(comm_4k_lines), pointer :: p => null()
   end type comm_4k_lines_pointer
 
+  type :: comm_4k_lines_
+    real(sp), dimension(:), allocatable :: profile ! (ntod)
+  end type comm_4k_lines_
+
   type, extends(comm_tod) :: comm_hfi_tod
      integer(i4b) :: n_4k_lines
+     class(comm_4k_lines_), allocatable, dimension(:,:) :: cooler_4k_lines_profile ! (ndet,nscan)
      real(sp) :: f_spin
      type(planck_rng) :: handle
      real(sp), allocatable, dimension(:) :: nus_4k_lines ! (n_4k_lines)
@@ -71,8 +76,10 @@ module comm_tod_hfi_mod
 
      procedure, private     :: stitch_hfi_dc_level
      procedure, private     :: hfi_dark_correction
-     procedure, private     :: estimate_hfi_4k_lines
-     procedure, private     :: remove_hfi_4k_lines
+     procedure, private     :: estimate_hfi_4k_lines_tod
+     procedure, private     :: estimate_hfi_4k_lines_harm
+     procedure, private     :: remove_hfi_4k_lines_tod
+     procedure, private     :: remove_hfi_4k_lines_harm
      procedure, private     :: deconvolve_rolloff
      procedure, private     :: fill_gaps
      procedure, private     :: sample_adc_and_baselines
@@ -471,7 +478,7 @@ interface
     integer(i4b),                        intent(in)    :: det
   end subroutine sample_adc_and_baselines
 
-  module subroutine estimate_hfi_4k_lines(self, sd, i_det, apply_mask, ps_output)
+  module subroutine estimate_hfi_4k_lines_tod(self, sd, i_det, apply_mask, filename_out)
     !  Construct and apply HFI instrument-specific corrections
     !  from 4k lines
     !
@@ -485,17 +492,41 @@ interface
     !       detector id
     !  apply_mask: logical
     !              apply mask to residuals    
-    !  ps_output: character array
-    !             output filename
+    !  filename_out: character array
+    !                output filename
     implicit none
     class(comm_hfi_tod),               intent(inout) :: self
     class(comm_scandata),              intent(inout) :: sd
     integer(i4b),                      intent(in)    :: i_det
     logical(lgt),            optional, intent(in)    :: apply_mask
-    character(len=*),        optional, intent(in)    :: ps_output
-  end subroutine estimate_hfi_4k_lines
+    character(len=*),        optional, intent(in)    :: filename_out
+  end subroutine estimate_hfi_4k_lines_tod
 
-  module subroutine remove_hfi_4k_lines(self, sd, i_det, apply_mask)
+  module subroutine estimate_hfi_4k_lines_harm(self, sd, i_det, apply_mask, filename_out)
+    !  Construct and apply HFI instrument-specific corrections
+    !  from 4k lines
+    !
+    !  Arguments:
+    !  ----------
+    !  self: comm_tod object
+    !  
+    !  sd: comm_scandata object
+    !      scan data
+    !  i_det: int
+    !       detector id
+    !  apply_mask: logical
+    !              apply mask to residuals    
+    !  filename_out: character array
+    !                output filename
+    implicit none
+    class(comm_hfi_tod),               intent(inout) :: self
+    class(comm_scandata),              intent(inout) :: sd
+    integer(i4b),                      intent(in)    :: i_det
+    logical(lgt),            optional, intent(in)    :: apply_mask
+    character(len=*),        optional, intent(in)    :: filename_out
+  end subroutine estimate_hfi_4k_lines_harm
+
+  module subroutine remove_hfi_4k_lines_tod(self, sd, i_det, apply_mask)
     !  Apply HFI instrument-specific corrections from 4k lines
     !
     !  Arguments:
@@ -513,7 +544,27 @@ interface
     class(comm_scandata),              intent(inout) :: sd
     integer(i4b),                      intent(in)    :: i_det
     logical(lgt),            optional, intent(in)    :: apply_mask
-  end subroutine remove_hfi_4k_lines
+  end subroutine remove_hfi_4k_lines_tod
+
+  module subroutine remove_hfi_4k_lines_harm(self, sd, i_det, apply_mask)
+    !  Apply HFI instrument-specific corrections from 4k lines
+    !
+    !  Arguments:
+    !  ----------
+    !  self: comm_tod object
+    !  
+    !  sd: comm_scandata object
+    !      scan data
+    !  i_det: int
+    !       detector id
+    !  apply_mask: logical
+    !              .true. to apply mask to residuals
+    implicit none
+    class(comm_hfi_tod),               intent(inout) :: self
+    class(comm_scandata),              intent(inout) :: sd
+    integer(i4b),                      intent(in)    :: i_det
+    logical(lgt),            optional, intent(in)    :: apply_mask
+  end subroutine remove_hfi_4k_lines_harm
 
   module subroutine deconvolve_rolloff(self, sd, i_det, ps_output, set_wn_level)
     ! Deconvolves high frequency rolloff in noise spectrum
