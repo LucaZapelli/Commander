@@ -69,8 +69,8 @@ contains
     c%samprate_lowres = 18.  ! Lowres samprate in Hz;  10 times lower than the intrinsic HFI rate for now    
     c%nmaps           = info%nmaps
     c%ndet            = num_tokens(cpar%ds_tod_dets(id_abs), "," )
-    !c%noise_psd_model = 'oof'       ! Not fitted parameters yet
-    c%noise_psd_model = 'spline'
+    c%noise_psd_model = 'oof'       ! Not fitted parameters yet
+    !c%noise_psd_model = 'spline'
 
     ! Initialize common parameters
     call c%tod_constructor(cpar, id, id_abs, info, tod_type)
@@ -266,14 +266,15 @@ contains
     deallocate(list_4k_lines)
 
     ! initialize 4k_lines objects
-    allocate(c%cooler_4k_lines(c%n_4k_lines,c%ndet,c%nscan))
-    do i = 1, c%nscan
-       do j = 1, c%ndet
-          do k = 1, c%n_4k_lines
-             c%cooler_4k_lines(k,j,i)%p => comm_4k_lines()
-          end do
-       end do
-    end do
+    allocate(c%cooler_4k_lines_profile(c%ndet,c%nscan))
+!    allocate(c%cooler_4k_lines(c%n_4k_lines,c%ndet,c%nscan))
+!    do i = 1, c%nscan
+!       do j = 1, c%ndet
+!          do k = 1, c%n_4k_lines
+!             c%cooler_4k_lines(k,j,i)%p => comm_4k_lines()
+!          end do
+!       end do
+!    end do
 
     ! Initialize dynamic mask
     c%dynmask => comm_dynmask(c, cpar)
@@ -505,7 +506,7 @@ contains
           
 
        ! Deconvolve high-frequency roll-off
-       if (.true.) then
+       if (.false.) then
           do j = 1, self%ndet
              if (.not. self%scans(i)%d(j)%accept) cycle
              call deconvolve_rolloff(self, sd, j)!,&
@@ -524,7 +525,7 @@ contains
        if (fit_4k_lines) then
           do j = 1, self%ndet
              if (.not. self%scans(i)%d(j)%accept) cycle
-             call estimate_hfi_4k_lines(self, sd, j)
+             call estimate_hfi_4k_lines_TOD(self, sd, j)
           end do
        end if
 
@@ -1467,18 +1468,18 @@ contains
     end if
     
     ! Deconvolve high-frequency roll-off
-    if (nonlin_lvl > 2) then
-       do i = 1, self%ndet
-          if (.not. self%scans(scan)%d(i)%accept) cycle
-          call deconvolve_rolloff(self, sd, i)
-       end do
-    end if
+!    if (.false. .and. nonlin_lvl > 2) then
+!       do i = 1, self%ndet
+!          if (.not. self%scans(scan)%d(i)%accept) cycle
+!          call deconvolve_rolloff(self, sd, i)
+!       end do
+!    end if
 
     ! Correct 4k lines
     if (.true. .and. nonlin_lvl > 3) then
        do i = 1, self%ndet
           if (.not. self%scans(scan)%d(i)%accept) cycle
-          call remove_hfi_4k_lines(self, sd, i)
+          call remove_hfi_4k_lines_TOD(self, sd, i)
        end do
     end if
 
@@ -1504,7 +1505,17 @@ contains
        end do
     end if
 
-   ! At the end, update spline noise model nodes
+
+   ! Deconvolve high-frequency roll-off after Tbol deconvolution
+   if (.false. .and. nonlin_lvl > 4) then
+       do i = 1, self%ndet
+          if (.not. self%scans(scan)%d(i)%accept) cycle
+          call deconvolve_rolloff(self, sd, i)
+       end do
+    end if
+
+
+   ! At the end, update spline noise model nodes (spline noise excess from roll-off deconvolution)
    if (.true. .and. self%noise_psd_model == 'spline') then
       do i = 1, self%ndet
          if (self%scans(scan)%d(i)%accept) call update_spline_noise_psd(self,sd,scan,i)
@@ -1556,7 +1567,7 @@ contains
 
   end subroutine hfi_dark_correction
 
-  module subroutine estimate_hfi_4k_lines(self, sd, i_det, apply_mask, ps_output)
+  module subroutine estimate_hfi_4k_lines_TOD(self, sd, i_det, apply_mask, filename_output)
     !  Construct and apply HFI instrument-specific corrections
     !  from 4k lines
     !
@@ -1577,247 +1588,471 @@ contains
     class(comm_scandata),              intent(inout) :: sd
     integer(i4b),                      intent(in)    :: i_det
     logical(lgt),            optional, intent(in)    :: apply_mask
-    character(len=*),        optional, intent(in)    :: ps_output
+    character(len=*),        optional, intent(in)    :: filename_output
 
-    integer(i4b) :: i, j, k, l, n, ntod, nomp, nfft, err, scan
-    integer(i4b) :: i0, i1, nsub, maxiter, n_f0, n_sig
-    integer*8    :: plan_fwd, plan_back
+    integer(i4b) :: i, j, k, l, m, ntod, scan
+    integer(i4b) :: n, nphi, dt_chunk, n_chunks, ind, i0, i1
     logical(lgt) :: apply_mask_
-    real(sp)     :: samprate, fmin, fmax, dnu, peak_val, gain, wn
-    real(sp)     :: A_fit, f0_fit, sigma_fit
-    real(sp),     allocatable, dimension(:)   :: dt, d_prime
-    real(sp),     allocatable, dimension(:)   :: ps_flat, ps_spikes, W
-    complex(spc), allocatable, dimension(:)   :: dv, dv_4K
-    real(sp),     allocatable, dimension(:,:) :: ps, sub_ps, profile
+    real(sp)     :: samprate, gain, wn, Ttot
+    real(sp),     allocatable, dimension(:) :: d_prime, chunk, templ
+    real(dp),     allocatable, dimension(:) :: times
 
     apply_mask_ = .false.; if (present(apply_mask)) apply_mask_ = apply_mask
-    
+
     scan     = sd%scan
     ntod     = self%scans(scan)%ntod
-    nomp     = 1
     samprate = self%samprate
-    nfft     = 2 * ntod
-    n        = nfft / 2 + 1
+    Ttot     = ntod/samprate
+    n        = self%n_4k_lines
+    nphi     = n+1
     wn       = abs(self%scans(scan)%d(i_det)%N_psd%sigma0)**2!_preproc)**2
 
-    call sfftw_init_threads(err)
-    call sfftw_plan_with_nthreads(nomp)
+    dt_chunk = 5*60*samprate ! 5 minutes chunks
+    n_chunks = (ntod + dt_chunk - 1) / dt_chunk
 
-    allocate(dt(nfft), dv(0:n-1), ps(1:n-1,2))
-    allocate(ps_flat(1:n-1), ps_spikes(1:n-1), W(1:n-1))
-    if (present(ps_output)) allocate(dv_4K(0:n-1))
-    call sfftw_plan_dft_r2c_1d(plan_fwd,  nfft, dt, dv, fftw_estimate + fftw_unaligned)
-    call sfftw_plan_dft_c2r_1d(plan_back, nfft, dv, dt, fftw_estimate + fftw_unaligned)
-
-    ! FFT
     gain = self%scans(scan)%d(i_det)%gain
     allocate(d_prime(ntod))
+    if (.not. allocated(self%cooler_4k_lines_profile(i_det,scan)%profile)) then
+       allocate(self%cooler_4k_lines_profile(i_det,scan)%profile(ntod))
+    end if
     d_prime = sd%tod(:,i_det) - gain * sd%s_tot(:,i_det,0,1)
 
     ! Output starting res tod
-    if (present(ps_output) .and. mod(self%scanid(scan),5000)==0) then
-       open(58,file='res_tod_4k_' // ps_output // '_before.dat', recl=1024)
-       do l = 1, n-1
+    if (present(filename_output) .and. mod(self%scanid(scan),10000)==0) then
+       open(58,file='res_tod_4k_' // filename_output // '_before.dat', recl=1024)
+       do l = 1, ntod
           write(58,*) l, d_prime(l), sd%mask(l,i_det)
        end do
        close(58)
     end if
 
-    if (apply_mask_) d_prime = d_prime * sd%mask(:,i_det)
-    dt(1:ntod)           = d_prime
-    dt(2*ntod:ntod+1:-1) = dt(1:ntod)
-    call timer%start(TOT_FFT)
-    call sfftw_execute_dft_r2c(plan_fwd, dt, dv)
-    call timer%stop(TOT_FFT)
-    do l = 1, n-1
-       ps(l,1) = l*(samprate/2)/(n-1)
-       ps(l,2) = abs(dv(l))** 2 / ntod
+    if (apply_mask_) d_prime = d_prime * sd%mask(:,i_det)  
+
+
+    do ind = 1, n_chunks
+       i0 = (ind-1)*dt_chunk + 1
+       i1 = min(ind*dt_chunk,ntod)
+       m = i1 - i0 + 1
+
+       allocate(times(m), chunk(m), templ(m))
+       templ = 0.d0
+       chunk = d_prime(i0:i1)
+       do j = i0, i1
+          times(j-i0+1) = real(j-1,dp)/real(samprate,dp)
+       end do
+       times = times - times(m/2)
+
+       call template_chunk(templ,times, chunk, sd%mask(i0:i1,i_det))
+       self%cooler_4k_lines_profile(i_det,scan)%profile(i0:i1) = templ
+       deallocate(times,chunk,templ)
     end do
-    deallocate(d_prime)
-    ps_flat   = ps(:,2)
-    ps_spikes = 1.d-12
-    if (present(ps_output)) dv_4K = dv
-    
-    ! Output starting noise power spectrum
-    if (present(ps_output) .and. mod(self%scanid(scan),5000)==0) then
-       open(58,file='res_ps_4k_' // ps_output // '_before.dat', recl=1024)
-       do l = 1, n-1
-          write(58,*) ps(l,1), ps(l,2)
+
+    d_prime = d_prime - self%cooler_4k_lines_profile(i_det,scan)%profile * sd%mask(:,i_det)
+
+    ! Output corrected res tod
+    if (present(filename_output) .and. mod(self%scanid(scan),10000)==0) then
+       open(58,file='res_tod_4k_' // filename_output // '_after.dat', recl=1024)
+       do l = 1, ntod
+          write(58,*) l, d_prime(l), sd%mask(l,i_det)
        end do
        close(58)
     end if
 
-
-    dnu = 0.03 ! Hz (size of freq window around each spike)
-    maxiter = 1 ! Can be extended to iterative correction
-    n_f0 = 50; n_sig = 100
-    do i = 1, self%n_4k_lines
-       fmin = self%nus_4k_lines(i) - dnu
-       fmax = self%nus_4k_lines(i) + dnu
-
-       ! Find window
-       i0 = 1
-       do while (i0 < ntod .and. ps(i0,1) < fmin)
-          i0 = i0 + 1
-       end do
-       i1 = i0 + 1
-       do while (i1 < ntod .and. ps(i1,1) < fmax)
-          i1 = i1 + 1
-       end do
-       nsub = i1 - i0 + 1
-       if(nsub < 5) return ! too small window
-       
-       if (allocated(self%cooler_4k_lines(i,i_det,scan)%p%spike_profile)) then
-          deallocate(self%cooler_4k_lines(i,i_det,scan)%p%spike_profile)
-       end if
-       
-       self%cooler_4k_lines(i,i_det,scan)%p%window = nsub
-       allocate(self%cooler_4k_lines(i,i_det,scan)%p%spike_profile(nsub,2))
-       allocate(sub_ps(nsub,2), profile(nsub,2))
-       sub_ps(:,1) = ps(i0:i1,1)
-       sub_ps(:,2) = ps(i0:i1,2)
-       profile(:,1) = sub_ps(:,1)
-       profile(:,2) = 1.d-12
-       self%cooler_4k_lines(i,i_det,scan)%p%spike_profile(:,2) = 1.d-12
-       peak_val = maxval(sub_ps(:,2))
-
-       if (.true.) then
-          ! Gaussian fit
-          ! Iterative cleaning loop
-          if (.not. allocated(self%cooler_4k_lines(i,i_det,scan)%p%A_fit)) allocate(self%cooler_4k_lines(i,i_det,scan)%p%A_fit(maxiter))
-          if (.not. allocated(self%cooler_4k_lines(i,i_det,scan)%p%f0_fit)) allocate(self%cooler_4k_lines(i,i_det,scan)%p%f0_fit(maxiter))
-          if (.not. allocated(self%cooler_4k_lines(i,i_det,scan)%p%sigma_fit)) allocate(self%cooler_4k_lines(i,i_det,scan)%p%sigma_fit(maxiter))
-          do j = 1, maxiter
-             ! 1. baseline_estimation
-             if (allocated(self%cooler_4k_lines(i,i_det,scan)%p%baseline)) then 
-                deallocate(self%cooler_4k_lines(i,i_det,scan)%p%baseline)
-             end if
-             call self%cooler_4k_lines(i,i_det,scan)%p%estimate_4k_baseline(sub_ps)
-
-             ! 2. residual = sub_ps - baseline
-             sub_ps(:,2) = sub_ps(:,2) - self%cooler_4k_lines(i,i_det,scan)%p%baseline
-
-             ! 3. amplitude linear fit
-             call self%cooler_4k_lines(i,i_det,scan)%p%A_lin_fit(sub_ps,j,n_f0,n_sig)
-             A_fit = self%cooler_4k_lines(i,i_det,scan)%p%A_fit(j)
-             f0_fit = self%cooler_4k_lines(i,i_det,scan)%p%f0_fit(j)
-             sigma_fit = self%cooler_4k_lines(i,i_det,scan)%p%sigma_fit(j)
-           
-             ! 4. subtract gaussian fit
-             sub_ps(:,2) = sub_ps(:,2) + self%cooler_4k_lines(i,i_det,scan)%p%baseline
-             do k = 1, nsub
-                profile(k,2) = profile(k,2) + A_fit * exp(-0.5 * ((profile(k,1) - f0_fit)/sigma_fit)**2)
-                sub_ps(k,2)  = sub_ps(k,2)  - A_fit * exp(-0.5 * ((sub_ps(k,1) - f0_fit)/sigma_fit)**2)
-                sub_ps(k,2) = max(wn/10,sub_ps(k,2)) ! avoid too strong correction
-             end do
-
-             ! 5. tolerance check?
-      
-          end do
-       else
-          ! Delta correction
-          do j = 1, maxiter
-             peak_val = maxval(sub_ps(:,2))
-             do k = 1, nsub
-                if (sub_ps(k,2)>=peak_val) then
-                   profile(k,2) = profile(k,2) + peak_val
-                   sub_ps(k,2) = wn
-                end if
-             end do
-          end do
-        end if
-
-
-       ! Save line profile
-       self%cooler_4k_lines(i,i_det,scan)%p%spike_profile(:,1) = profile(:,1)
-       self%cooler_4k_lines(i,i_det,scan)%p%spike_profile(:,2) = self%cooler_4k_lines(i,i_det,scan)%p%spike_profile(:,2) + profile(:,2)
-       deallocate(profile)
-
-       ps_spikes(i0:i1) = self%cooler_4k_lines(i,i_det,scan)%p%spike_profile(:,2)
-       ps_flat(i0:i1) = sub_ps(:,2)
-       deallocate(sub_ps)
-    end do
-
-    ! Wiener filter
-    W = ps_flat / (ps_flat + ps_spikes)
-    dv(1:n-1) = dv(1:n-1) * W
-    do l = 1, n-1
-       ps(l,1) = l*(samprate/2)/(n-1)
-       ps(l,2) = abs(dv(l))** 2 / ntod
-    end do
-    deallocate(W)
-
-    ! Output 4K_lines tod
-    if (present(ps_output) .and. mod(self%scanid(scan),5000)==0) then
-       dv_4K = dv_4K - dv
-       do l = 1, n-1
-          ps_spikes(l) = abs(dv_4K(l))** 2 / ntod
-       end do
-
-       call timer%start(TOT_FFT)
-       call sfftw_execute_dft_c2r(plan_back, dv_4K, dt)
-       call timer%stop(TOT_FFT)
-
-       dt  = dt / nfft
-
-       open(58,file='4k_lines_tod_' // ps_output // '.dat', recl=1024)
-       do l = 1, n-1
-          write(58,*) l, dt(l)
-       end do
-       close(58)
-
-
-       open(58,file='4k_lines_ps_' // ps_output // '.dat', recl=1024)
-       do l = 1, n-1
-          write(58,*) ps(l,1), ps_spikes(l)
-       end do
-       close(58)
-       deallocate(dv_4k)
-    end if
-
-    deallocate(ps_flat, ps_spikes)
-
-    ! FFT back to TOD
-    call timer%start(TOT_FFT)
-    call sfftw_execute_dft_c2r(plan_back, dv, dt)
-    call timer%stop(TOT_FFT)
-
-    dt  = dt / nfft
-    sd%tod(:,i_det) = dt(1:ntod)+ gain * sd%s_tot(:,i_det,0,1)
+    sd%tod(:,i_det) = d_prime + gain * sd%s_tot(:,i_det,0,1)
     do i = 1, ntod
        if (sd%mask(i,i_det) == 0) then
           sd%tod(i,i_det) = sd%tod(i,i_det) + sqrt(wn) * rand_gauss(self%handle)
        end if
     end do
 
-    ! Output corrected res tod
-    if (present(ps_output) .and. mod(self%scanid(scan),5000)==0) then
-       open(58,file='res_tod_4k_' // ps_output // '_after.dat', recl=1024)
-       do l = 1, ntod
-          write(58,*) l, sd%tod(l,i_det)
+    deallocate(d_prime)
+
+    contains
+
+    subroutine template_chunk(templ,times,chunk,mask)
+       real(sp), dimension(:), intent(inout) :: templ
+       real(sp), dimension(:), intent(in)    :: chunk, mask
+       real(dp), dimension(:), intent(in)    :: times
+
+       integer(i4b) :: ierr
+       real(dp)     :: phi, tr
+       real(dp), allocatable, dimension(:)   :: ATd, row, y, x
+       real(dp), allocatable, dimension(:,:) :: ATA
+
+       allocate(ATA(2*nphi, 2*nphi), ATd(2*nphi), row(2*nphi))
+       allocate(y(2*nphi), x(2*nphi))
+       ATA = 0.d0; ATd = 0.d0; row = 0.d0
+       y = 0.d0; x = 0.d0
+
+       do i = 1, m
+          if (mask(i) == 0) cycle
+          row(1) = 1.d0
+          row(2) = times(i)
+          do j = 1, n
+             phi = 2*PI*self%nus_4k_lines(j)
+             row(2*j+1) = cos(phi*times(i))
+             row(2*j+2) = sin(phi*times(i))
+          end do
+
+          do j = 1, 2*nphi
+             ATd(j) = ATd(j) + row(j)*chunk(i)
+             do k = j, 2*nphi
+                ATA(j,k) = ATA(j,k) + row(j) * row(k)
+             end do
+          end do
+       end do       
+
+       ! Symmetrization
+       do i = 1, 2*nphi
+          do j = i+1, 2*nphi
+             ATA(j,i) = ATA(i,j)
+          end do
        end do
-       close(58)
-    end if
 
-
-    ! Output corrected noise power spectrum
-    if (present(ps_output)) then
-       open(58,file=ps_output // '_corrected.dat', recl=1024)
-       do l = 1, n-1
-          write(58,*) ps(l,1), ps(l,2)
+       tr = 0.d0 ! regularization
+       do i = 1, 2*nphi
+          tr = tr + ATA(i,i)
        end do
-       close(58)
-    end if
+       do i = 1, 2*nphi
+          ATA(i,i) = ATA(i,i) + 1.d-12 * tr / real(2*nphi, dp)
+       end do
 
-    sd%tod(:,i_det) = sd%tod(:,i_det) + gain * sd%s_tot(:,i_det,0,1)
+       ! Cholesky
+       call cholesky_decompose_single(ATA, ierr=ierr)
+       if (ierr /= 0) then
+          deallocate(ATA, ATd, row, y, x)
+          write(*,*) 'Error: 4K cholesky decomposition failed.'
+          return
+       end if
 
-    deallocate(dt, dv, ps)
-    call dfftw_destroy_plan(plan_fwd)
-    call dfftw_destroy_plan(plan_back)
+       do i = 1, 2*nphi
+          y(i) = (ATd(i) - dot_product(ATA(i,1:i-1), y(1:i-1))) / ATA(i,i)
+       end do
+       do i = 2*nphi, 1, -1
+          x(i) = (y(i) - dot_product(ATA(i+1:2*nphi,i), x(i+1:2*nphi))) / ATA(i,i)
+       end do
+       
+       ! Build template
+       do i = 1, n
+          phi = 2*PI*self%nus_4k_lines(i) 
+          templ = templ + x(2*i+1) * cos(phi*times) + x(2*i+2) * sin(phi*times)
+       end do
+    
+       deallocate(ATA,ATd,row,y,x)
+    end subroutine template_chunk
 
-  end subroutine estimate_hfi_4k_lines
+  end subroutine estimate_hfi_4k_lines_TOD
 
-  module subroutine remove_hfi_4k_lines(self, sd, i_det, apply_mask)
+
+!  module subroutine estimate_hfi_4k_lines(self, sd, i_det, apply_mask, ps_output)
+    !  Construct and apply HFI instrument-specific corrections
+    !  from 4k lines
+    !
+    !  Arguments:
+    !  ----------
+    !  self: comm_tod object
+    !
+    !  sd: comm_scandata object
+    !       scan data
+    !  i_det: int
+    !       detector id
+    !  apply_mask: logaical
+    !              apply mask to residuals
+    !  ps_output: character array
+    !             output filename    
+!    implicit none
+!    class(comm_hfi_tod),               intent(inout) :: self
+!    class(comm_scandata),              intent(inout) :: sd
+!    integer(i4b),                      intent(in)    :: i_det
+!    logical(lgt),            optional, intent(in)    :: apply_mask
+!    character(len=*),        optional, intent(in)    :: ps_output
+!
+!    integer(i4b) :: i, j, k, l, n, ntod, nomp, nfft, err, scan
+!    integer(i4b) :: i0, i1, nsub, maxiter, n_f0, n_sig
+!    integer*8    :: plan_fwd, plan_back
+!    logical(lgt) :: apply_mask_
+!    real(sp)     :: samprate, fmin, fmax, dnu, peak_val, gain, wn
+!    real(sp)     :: A_fit, f0_fit, sigma_fit
+!    real(sp),     allocatable, dimension(:)   :: dt, d_prime
+!    real(sp),     allocatable, dimension(:)   :: ps_flat, ps_spikes, W
+!    complex(spc), allocatable, dimension(:)   :: dv, dv_4K
+!    real(sp),     allocatable, dimension(:,:) :: ps, sub_ps, profile
+!
+!    apply_mask_ = .false.; if (present(apply_mask)) apply_mask_ = apply_mask
+!    
+!    scan     = sd%scan
+!    ntod     = self%scans(scan)%ntod
+!    nomp     = 1
+!    samprate = self%samprate
+!    nfft     = 2 * ntod
+!    n        = nfft / 2 + 1
+!    wn       = abs(self%scans(scan)%d(i_det)%N_psd%sigma0)**2!_preproc)**2
+!
+!    call sfftw_init_threads(err)
+!    call sfftw_plan_with_nthreads(nomp)
+!
+!    allocate(dt(nfft), dv(0:n-1), ps(1:n-1,2))
+!    allocate(ps_flat(1:n-1), ps_spikes(1:n-1), W(1:n-1))
+!    if (present(ps_output)) allocate(dv_4K(0:n-1))
+!    call sfftw_plan_dft_r2c_1d(plan_fwd,  nfft, dt, dv, fftw_estimate + fftw_unaligned)
+!    call sfftw_plan_dft_c2r_1d(plan_back, nfft, dv, dt, fftw_estimate + fftw_unaligned)
+!
+!    ! FFT
+!    gain = self%scans(scan)%d(i_det)%gain
+!    allocate(d_prime(ntod))
+!    d_prime = sd%tod(:,i_det) - gain * sd%s_tot(:,i_det,0,1)
+!
+!    ! Output starting res tod
+!    if (present(ps_output) .and. mod(self%scanid(scan),5000)==0) then
+!       open(58,file='res_tod_4k_' // ps_output // '_before.dat', recl=1024)
+!       do l = 1, n-1
+!          write(58,*) l, d_prime(l), sd%mask(l,i_det)
+!       end do
+!       close(58)
+!    end if
+!
+!    if (apply_mask_) d_prime = d_prime * sd%mask(:,i_det)
+!    dt(1:ntod)           = d_prime
+!    dt(2*ntod:ntod+1:-1) = dt(1:ntod)
+!    call timer%start(TOT_FFT)
+!    call sfftw_execute_dft_r2c(plan_fwd, dt, dv)
+!    call timer%stop(TOT_FFT)
+!    do l = 1, n-1
+!       ps(l,1) = l*(samprate/2)/(n-1)
+!       ps(l,2) = abs(dv(l))** 2 / ntod
+!    end do
+!    deallocate(d_prime)
+!    ps_flat   = ps(:,2)
+!    ps_spikes = 1.d-12
+!    if (present(ps_output)) dv_4K = dv
+!    
+!    ! Output starting noise power spectrum
+!    if (present(ps_output) .and. mod(self%scanid(scan),5000)==0) then
+!       open(58,file="res_ps_4k_" // ps_output // "_before.dat", recl=1024)
+!       do l = 1, n-1
+!          write(58,*) ps(l,1), ps(l,2)
+!       end do
+!       close(58)
+!    end if
+!
+!
+!    dnu = 0.03 ! Hz (size of freq window around each spike)
+!    maxiter = 1 ! Can be extended to iterative correction
+!    n_f0 = 50; n_sig = 100
+!    do i = 1, self%n_4k_lines
+!       fmin = self%nus_4k_lines(i) - dnu
+!       fmax = self%nus_4k_lines(i) + dnu
+!
+!       ! Find window
+!       i0 = 1
+!       do while (i0 < ntod .and. ps(i0,1) < fmin)
+!          i0 = i0 + 1
+!       end do
+!       i1 = i0 + 1
+!       do while (i1 < ntod .and. ps(i1,1) < fmax)
+!          i1 = i1 + 1
+!       end do
+!       nsub = i1 - i0 + 1
+!       if(nsub < 5) return ! too small window
+!       
+!       if (allocated(self%cooler_4k_lines(i,i_det,scan)%p%spike_profile)) then
+!          deallocate(self%cooler_4k_lines(i,i_det,scan)%p%spike_profile)
+!       end if
+!       
+!       self%cooler_4k_lines(i,i_det,scan)%p%window = nsub
+!       allocate(self%cooler_4k_lines(i,i_det,scan)%p%spike_profile(nsub,2))
+!       allocate(sub_ps(nsub,2), profile(nsub,2))
+!       sub_ps(:,1) = ps(i0:i1,1)
+!       sub_ps(:,2) = ps(i0:i1,2)
+!       profile(:,1) = sub_ps(:,1)
+!       profile(:,2) = 1.d-12
+!       self%cooler_4k_lines(i,i_det,scan)%p%spike_profile(:,2) = 1.d-12
+!       peak_val = maxval(sub_ps(:,2))
+!
+!       if (.true.) then
+!          ! Gaussian fit
+!          ! Iterative cleaning loop
+!          if (.not. allocated(self%cooler_4k_lines(i,i_det,scan)%p%A_fit)) allocate(self%cooler_4k_lines(i,i_det,scan)%p%A_fit(maxiter))
+!          if (.not. allocated(self%cooler_4k_lines(i,i_det,scan)%p%f0_fit)) allocate(self%cooler_4k_lines(i,i_det,scan)%p%f0_fit(maxiter))
+!          if (.not. allocated(self%cooler_4k_lines(i,i_det,scan)%p%sigma_fit)) allocate(self%cooler_4k_lines(i,i_det,scan)%p%sigma_fit(maxiter))
+!          do j = 1, maxiter
+!             ! 1. baseline_estimation
+!             if (allocated(self%cooler_4k_lines(i,i_det,scan)%p%baseline)) then 
+!                deallocate(self%cooler_4k_lines(i,i_det,scan)%p%baseline)
+!             end if
+!             call self%cooler_4k_lines(i,i_det,scan)%p%estimate_4k_baseline(sub_ps)
+!
+!             ! 2. residual = sub_ps - baseline
+!             sub_ps(:,2) = sub_ps(:,2) - self%cooler_4k_lines(i,i_det,scan)%p%baseline
+!
+!             ! 3. amplitude linear fit
+!             call self%cooler_4k_lines(i,i_det,scan)%p%A_lin_fit(sub_ps,j,n_f0,n_sig)
+!             A_fit = self%cooler_4k_lines(i,i_det,scan)%p%A_fit(j)
+!             f0_fit = self%cooler_4k_lines(i,i_det,scan)%p%f0_fit(j)
+!             sigma_fit = self%cooler_4k_lines(i,i_det,scan)%p%sigma_fit(j)
+!           
+!             ! 4. subtract gaussian fit
+!             sub_ps(:,2) = sub_ps(:,2) + self%cooler_4k_lines(i,i_det,scan)%p%baseline
+!             do k = 1, nsub
+!                profile(k,2) = profile(k,2) + A_fit * exp(-0.5 * ((profile(k,1) - f0_fit)/sigma_fit)**2)
+!                sub_ps(k,2)  = sub_ps(k,2)  - A_fit * exp(-0.5 * ((sub_ps(k,1) - f0_fit)/sigma_fit)**2)
+!                sub_ps(k,2) = max(wn/10,sub_ps(k,2)) ! avoid too strong correction
+!             end do
+!
+!             ! 5. tolerance check?
+!      
+!          end do
+!       else
+!          ! Delta correction
+!          do j = 1, maxiter
+!             peak_val = maxval(sub_ps(:,2))
+!             do k = 1, nsub
+!                if (sub_ps(k,2)>=peak_val) then
+!                   profile(k,2) = profile(k,2) + peak_val
+!                   sub_ps(k,2) = wn
+!                end if
+!             end do
+!          end do
+!        end if
+!
+!
+!       ! Save line profile
+!       self%cooler_4k_lines(i,i_det,scan)%p%spike_profile(:,1) = profile(:,1)
+!       self%cooler_4k_lines(i,i_det,scan)%p%spike_profile(:,2) = self%cooler_4k_lines(i,i_det,scan)%p%spike_profile(:,2) + profile(:,2)
+!       deallocate(profile)
+!
+!       ps_spikes(i0:i1) = self%cooler_4k_lines(i,i_det,scan)%p%spike_profile(:,2)
+!       ps_flat(i0:i1) = sub_ps(:,2)
+!       deallocate(sub_ps)
+!    end do
+!
+!    ! Wiener filter
+!    W = ps_flat / (ps_flat + ps_spikes)
+!    dv(1:n-1) = dv(1:n-1) * W
+!    do l = 1, n-1
+!       ps(l,1) = l*(samprate/2)/(n-1)
+!       ps(l,2) = abs(dv(l))** 2 / ntod
+!    end do
+!    deallocate(W)
+!
+!    ! Output 4K_lines tod
+!    if (present(ps_output) .and. mod(self%scanid(scan),5000)==0) then
+!       dv_4K = dv_4K - dv
+!       do l = 1, n-1
+!          ps_spikes(l) = abs(dv_4K(l))** 2 / ntod
+!       end do
+!
+!       call timer%start(TOT_FFT)
+!       call sfftw_execute_dft_c2r(plan_back, dv_4K, dt)
+!       call timer%stop(TOT_FFT)
+!
+!       dt  = dt / nfft
+!
+!       open(58,file="4k_lines_tod_" // ps_output // ".dat", recl=1024)
+!       do l = 1, n-1
+!          write(58,*) l, dt(l)
+!       end do
+!       close(58)
+!
+!
+!       open(58,file="4k_lines_ps_" // ps_output // ".dat", recl=1024)
+!       do l = 1, n-1
+!          write(58,*) ps(l,1), ps_spikes(l)
+!       end do
+!       close(58)
+!       deallocate(dv_4k)
+!    end if
+!
+!    deallocate(ps_flat, ps_spikes)
+!
+!    ! FFT back to TOD
+!    call timer%start(TOT_FFT)
+!    call sfftw_execute_dft_c2r(plan_back, dv, dt)
+!    call timer%stop(TOT_FFT)
+!
+!    dt  = dt / nfft
+!    sd%tod(:,i_det) = dt(1:ntod)+ gain * sd%s_tot(:,i_det,0,1)
+!    do i = 1, ntod
+!       if (sd%mask(i,i_det) == 0) then
+!          sd%tod(i,i_det) = sd%tod(i,i_det) + sqrt(wn) * rand_gauss(self%handle)
+!       end if
+!    end do
+!
+!    ! Output corrected res tod
+!    if (present(ps_output) .and. mod(self%scanid(scan),5000)==0) then
+!       open(58,file="res_tod_4k_" // ps_output // "_after.dat", recl=1024)
+!       do l = 1, ntod
+!          write(58,*) l, sd%tod(l,i_det)
+!       end do
+!       close(58)
+!    end if
+!
+!
+!    ! Output corrected noise power spectrum
+!    if (present(ps_output)) then
+!       open(58,file=ps_output // "_corrected.dat", recl=1024)
+!       do l = 1, n-1
+!          write(58,*) ps(l,1), ps(l,2)
+!       end do
+!       close(58)
+!    end if
+!
+!    sd%tod(:,i_det) = sd%tod(:,i_det) + gain * sd%s_tot(:,i_det,0,1)
+!
+!    deallocate(dt, dv, ps)
+!    call dfftw_destroy_plan(plan_fwd)
+!    call dfftw_destroy_plan(plan_back)
+!
+!  end subroutine estimate_hfi_4k_lines
+
+
+  module subroutine remove_hfi_4k_lines_TOD(self, sd, i_det, apply_mask)
+    implicit none
+    class(comm_hfi_tod),               intent(inout) :: self
+    class(comm_scandata),              intent(inout) :: sd
+    integer(i4b),                      intent(in)    :: i_det
+    logical(lgt),            optional, intent(in)    :: apply_mask
+
+    integer(i4b) :: i, j, k, l, n, ntod, nomp, nfft, err, scan
+    integer(i4b) :: i0, i1
+    logical(lgt) :: apply_mask_, remove_4k_lines
+    real(sp)     :: gain, wn
+    real(sp),     allocatable, dimension(:)   :: d_prime
+
+    scan     = sd%scan
+    remove_4k_lines = .false.
+    do i = 1, self%n_4k_lines
+       if (allocated(self%cooler_4k_lines_profile(i_det,scan)%profile)) then
+          remove_4k_lines = .true.
+       end if
+    end do
+    if (.not. remove_4k_lines) return
+
+    apply_mask_ = .true.; if (present(apply_mask)) apply_mask_ = apply_mask
+    ntod = self%scans(scan)%ntod
+    wn       = abs(self%scans(scan)%d(i_det)%N_psd%sigma0)**2
+
+    gain = self%scans(scan)%d(i_det)%gain
+    allocate(d_prime(ntod))
+    d_prime = sd%tod(:,i_det) - gain * sd%s_tot(:,i_det,0,1)    
+    if (apply_mask_) d_prime = d_prime * sd%mask(:,i_det)
+
+    d_prime = d_prime - self%cooler_4k_lines_profile(i_det,scan)%profile * sd%mask(:,i_det)
+
+    sd%tod(:,i_det) = d_prime + gain * sd%s_tot(:,i_det,0,1)
+    do i = 1, ntod
+       if (sd%mask(i,i_det) == 0) then
+          sd%tod(i,i_det) = sd%tod(i,i_det) + sqrt(wn) * rand_gauss(self%handle)
+       end if
+    end do
+
+    deallocate(d_prime)
+
+  end subroutine remove_hfi_4k_lines_TOD
+
+
+
+!  module subroutine remove_hfi_4k_lines(self, sd, i_det, apply_mask)
     !  Apply HFI instrument-specific corrections from 4k lines
     !
     !  Arguments:
@@ -1830,121 +2065,122 @@ contains
     !       detector id
     !  apply_mask: logical
     !              apply mask to residuals    
-    implicit none
-    class(comm_hfi_tod),               intent(inout) :: self
-    class(comm_scandata),              intent(inout) :: sd
-    integer(i4b),                      intent(in)    :: i_det
-    logical(lgt),            optional, intent(in)    :: apply_mask
+!    implicit none
+!    class(comm_hfi_tod),               intent(inout) :: self
+!    class(comm_scandata),              intent(inout) :: sd
+!    integer(i4b),                      intent(in)    :: i_det
+!    logical(lgt),            optional, intent(in)    :: apply_mask
+!
+!    integer(i4b) :: i, j, k, l, n, ntod, nomp, nfft, err, scan
+!    integer(i4b) :: i0, i1, nsub
+!    integer*8    :: plan_fwd, plan_back
+!    logical(lgt) :: apply_mask_, remove_4k_lines
+!    real(sp)     :: samprate, fmin, fmax, dnu, peak_val, gain, wn
+!    real(sp),     allocatable, dimension(:)   :: dt, d_prime
+!    real(sp),     allocatable, dimension(:)   :: ps_flat, ps_spikes, W
+!    complex(spc), allocatable, dimension(:)   :: dv
+!    real(sp),     allocatable, dimension(:,:) :: ps
+!
+!    scan     = sd%scan
+!    remove_4k_lines = .false.
+!    do i = 1, self%n_4k_lines
+!       if (allocated(self%cooler_4k_lines(i,i_det,scan)%p%spike_profile)) then
+!          remove_4k_lines = .true.
+!       end if
+!    end do
+!    if (.not. remove_4k_lines) return
+!
+!
+!    apply_mask_ = .true.; if (present(apply_mask)) apply_mask_ = apply_mask
+!    ntod = self%scans(scan)%ntod
+!    nomp     = 1
+!    samprate = self%samprate
+!    nfft     = 2 * ntod
+!    n        = nfft / 2 + 1
+!    wn       = abs(self%scans(scan)%d(i_det)%N_psd%sigma0)**2
+!
+!    call sfftw_init_threads(err)
+!    call sfftw_plan_with_nthreads(nomp)
+!
+!    allocate(dt(nfft), dv(0:n-1), ps(1:n-1,2))
+!    allocate(ps_flat(1:n-1), ps_spikes(1:n-1), W(1:n-1))
+!    call sfftw_plan_dft_r2c_1d(plan_fwd,  nfft, dt, dv, fftw_estimate + fftw_unaligned)
+!    call sfftw_plan_dft_c2r_1d(plan_back, nfft, dv, dt, fftw_estimate + fftw_unaligned)
+!
+!    ! FFT
+!    gain = self%scans(scan)%d(i_det)%gain
+!    allocate(d_prime(ntod))
+!    d_prime = sd%tod(:,i_det) - gain * sd%s_tot(:,i_det,0,1)
+!    if (apply_mask_) d_prime = d_prime * sd%mask(:,i_det)
+!
+!    dt(1:ntod)           = d_prime
+!    dt(2*ntod:ntod+1:-1) = dt(1:ntod)
+!    call timer%start(TOT_FFT)
+!    call sfftw_execute_dft_r2c(plan_fwd, dt, dv)
+!    call timer%stop(TOT_FFT)
+!    do l = 1, n-1
+!       ps(l,1) = l*(samprate/2)/(n-1)
+!       ps(l,2) = abs(dv(l))** 2 / ntod
+!    end do    
+!    deallocate(d_prime)
+!    ps_flat   = ps(:,2)
+!    ps_spikes = 1.d-12
+!
+!    dnu = 0.03 ! Hz (size of freq window around each spike)
+!    do i = 1, self%n_4k_lines
+!       fmin = self%nus_4k_lines(i) - dnu
+!       fmax = self%nus_4k_lines(i) + dnu
+!
+!       ! Find window
+!       i0 = 1
+!       do while (i0 < ntod .and. ps(i0,1) < fmin)
+!          i0 = i0 + 1
+!       end do
+!       i1 = i0 + 1
+!       do while (i1 < ntod .and. ps(i1,1) < fmax)
+!          i1 = i1 + 1
+!       end do
+!       nsub = i1 - i0 + 1
+!       if(nsub < 5) return ! too small window
+!
+!       ps_spikes(i0:i1) = self%cooler_4k_lines(i,i_det,scan)%p%spike_profile(:,2)
+!       ps_flat(i0:i1) = ps_flat(i0:i1) - ps_spikes(i0:i1)
+!       do k = 0, nsub-1
+!          ps_flat(i0+k) = max(wn/10,ps_flat(i0+k))
+!       end do
+!    end do
+!
+!    ! Weiner filter
+!    W = ps_flat / (ps_flat + ps_spikes)
+!    deallocate(ps_flat,ps_spikes)
+!    dv(1:n-1) = dv(1:n-1) * W
+!    do l = 1, n-1
+!       ps(l,1) = l*(samprate/2)/(n-1)
+!       ps(l,2) = abs(dv(l))** 2 / ntod
+!    end do
+!    deallocate(W)
+!
+!    ! FFT back to TOD
+!    call timer%start(TOT_FFT)
+!    call sfftw_execute_dft_c2r(plan_back, dv, dt)
+!    call timer%stop(TOT_FFT)
+!
+!    dt  = dt / nfft
+!    sd%tod(:,i_det) = dt(1:ntod)
+!    do i = 1, ntod
+!       if (sd%mask(i,i_det) == 0) then
+!          sd%tod(i,i_det) = sd%tod(i,i_det) + sqrt(wn) * rand_gauss(self%handle)
+!       end if
+!    end do
+!
+!    sd%tod(:,i_det) = sd%tod(:,i_det) + gain * sd%s_tot(:,i_det,0,1)
+!
+!    deallocate(dt, dv, ps)
+!    call dfftw_destroy_plan(plan_fwd)
+!    call dfftw_destroy_plan(plan_back)
+! 
+!  end subroutine remove_hfi_4k_lines
 
-    integer(i4b) :: i, j, k, l, n, ntod, nomp, nfft, err, scan
-    integer(i4b) :: i0, i1, nsub
-    integer*8    :: plan_fwd, plan_back
-    logical(lgt) :: apply_mask_, remove_4k_lines
-    real(sp)     :: samprate, fmin, fmax, dnu, peak_val, gain, wn
-    real(sp),     allocatable, dimension(:)   :: dt, d_prime
-    real(sp),     allocatable, dimension(:)   :: ps_flat, ps_spikes, W
-    complex(spc), allocatable, dimension(:)   :: dv
-    real(sp),     allocatable, dimension(:,:) :: ps
-
-    scan     = sd%scan
-    remove_4k_lines = .false.
-    do i = 1, self%n_4k_lines
-       if (allocated(self%cooler_4k_lines(i,i_det,scan)%p%spike_profile)) then
-          remove_4k_lines = .true.
-       end if
-    end do
-    if (.not. remove_4k_lines) return
-
-
-    apply_mask_ = .true.; if (present(apply_mask)) apply_mask_ = apply_mask
-    ntod = self%scans(scan)%ntod
-    nomp     = 1
-    samprate = self%samprate
-    nfft     = 2 * ntod
-    n        = nfft / 2 + 1
-    wn       = abs(self%scans(scan)%d(i_det)%N_psd%sigma0)**2
-
-    call sfftw_init_threads(err)
-    call sfftw_plan_with_nthreads(nomp)
-
-    allocate(dt(nfft), dv(0:n-1), ps(1:n-1,2))
-    allocate(ps_flat(1:n-1), ps_spikes(1:n-1), W(1:n-1))
-    call sfftw_plan_dft_r2c_1d(plan_fwd,  nfft, dt, dv, fftw_estimate + fftw_unaligned)
-    call sfftw_plan_dft_c2r_1d(plan_back, nfft, dv, dt, fftw_estimate + fftw_unaligned)
-
-    ! FFT
-    gain = self%scans(scan)%d(i_det)%gain
-    allocate(d_prime(ntod))
-    d_prime = sd%tod(:,i_det) - gain * sd%s_tot(:,i_det,0,1)
-    if (apply_mask_) d_prime = d_prime * sd%mask(:,i_det)
-
-    dt(1:ntod)           = d_prime
-    dt(2*ntod:ntod+1:-1) = dt(1:ntod)
-    call timer%start(TOT_FFT)
-    call sfftw_execute_dft_r2c(plan_fwd, dt, dv)
-    call timer%stop(TOT_FFT)
-    do l = 1, n-1
-       ps(l,1) = l*(samprate/2)/(n-1)
-       ps(l,2) = abs(dv(l))** 2 / ntod
-    end do    
-    deallocate(d_prime)
-    ps_flat   = ps(:,2)
-    ps_spikes = 1.d-12
-
-    dnu = 0.03 ! Hz (size of freq window around each spike)
-    do i = 1, self%n_4k_lines
-       fmin = self%nus_4k_lines(i) - dnu
-       fmax = self%nus_4k_lines(i) + dnu
-
-       ! Find window
-       i0 = 1
-       do while (i0 < ntod .and. ps(i0,1) < fmin)
-          i0 = i0 + 1
-       end do
-       i1 = i0 + 1
-       do while (i1 < ntod .and. ps(i1,1) < fmax)
-          i1 = i1 + 1
-       end do
-       nsub = i1 - i0 + 1
-       if(nsub < 5) return ! too small window
-
-       ps_spikes(i0:i1) = self%cooler_4k_lines(i,i_det,scan)%p%spike_profile(:,2)
-       ps_flat(i0:i1) = ps_flat(i0:i1) - ps_spikes(i0:i1)
-       do k = 0, nsub-1
-          ps_flat(i0+k) = max(wn/10,ps_flat(i0+k))
-       end do
-    end do
-
-    ! Weiner filter
-    W = ps_flat / (ps_flat + ps_spikes)
-    deallocate(ps_flat,ps_spikes)
-    dv(1:n-1) = dv(1:n-1) * W
-    do l = 1, n-1
-       ps(l,1) = l*(samprate/2)/(n-1)
-       ps(l,2) = abs(dv(l))** 2 / ntod
-    end do
-    deallocate(W)
-
-    ! FFT back to TOD
-    call timer%start(TOT_FFT)
-    call sfftw_execute_dft_c2r(plan_back, dv, dt)
-    call timer%stop(TOT_FFT)
-
-    dt  = dt / nfft
-    sd%tod(:,i_det) = dt(1:ntod)
-    do i = 1, ntod
-       if (sd%mask(i,i_det) == 0) then
-          sd%tod(i,i_det) = sd%tod(i,i_det) + sqrt(wn) * rand_gauss(self%handle)
-       end if
-    end do
-
-    sd%tod(:,i_det) = sd%tod(:,i_det) + gain * sd%s_tot(:,i_det,0,1)
-
-    deallocate(dt, dv, ps)
-    call dfftw_destroy_plan(plan_fwd)
-    call dfftw_destroy_plan(plan_back)
- 
-  end subroutine remove_hfi_4k_lines
 
   module subroutine deconvolve_rolloff(self, sd, i_det, ps_output, set_wn_level)
     ! Deconvolves high frequency rolloff in noise spectrum
